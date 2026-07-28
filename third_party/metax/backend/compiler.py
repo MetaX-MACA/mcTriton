@@ -291,7 +291,7 @@ class MACABackend(BaseBackend):
                     mixed = True if 'mixed' in opt.pipeline else False
                     metax.passes.ttgpuir.add_tritonmetaxgpu_addptr_opt_pass(pm, opt.num_stages, fullstage, mixed)
                     passes.ttgpuir.add_remove_layout_conversions(pm)
-                    metax.passes.ttgpuir.add_pipeline_async_tn(pm, opt.num_stages, inner_stages[0], inner_stages[1])
+                    metax.passes.ttgpuir.add_split_tensor_map(pm, inner_stages[0], inner_stages[1])
                     metax.passes.ttgpuir.add_pipeline_async_tt(pm, opt.num_stages)
                     metax.passes.ttgpuir.add_pipeline_async_base(pm, opt.num_stages, fullstage, mixed)
             else:

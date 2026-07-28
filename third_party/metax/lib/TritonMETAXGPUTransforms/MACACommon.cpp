@@ -216,10 +216,6 @@ unsigned getGVMNumberPerOp(triton::LoadOp &load) {
   unsigned inVec = axisInfoAnalysis.getContiguity(load.getPtr());
   auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
   inVec = std::min<unsigned>(128 / pointeeBitWidth, inVec);
-  if (load.getMask()) {
-    unsigned maskVec = axisInfoAnalysis.getMaskAlignment(load.getMask());
-    inVec = std::min<unsigned>(maskVec, inVec);
-  }
 
   if (!getenv("TRITON_DISABLE_CONSTANCY_LOAD_LAYOUT_OPT")) {
     auto order = triton::gpu::getOrder(tensorTy);
@@ -246,10 +242,9 @@ unsigned getGVMNumberPerOp(triton::LoadOp &load) {
       constRepeatPerThread = 1;
     }
 
-    if (load.getMask()) {
-      unsigned maskVec = axisInfoAnalysis.getMaskAlignment(load.getMask());
-      constRepeatPerThread = std::min<unsigned>(constRepeatPerThread, maskVec);
-    }
+    // Async global-to-local lowers to a predicated vector ldg. Its mask does
+    // not scalarize the memory instruction, so count the emitted vector ldg
+    // operations from pointer contiguity rather than mask alignment.
     inVec = inVec * constRepeatPerThread;
   }
 

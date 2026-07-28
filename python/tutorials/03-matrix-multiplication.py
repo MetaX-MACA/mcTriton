@@ -439,3 +439,162 @@ triton_output = matmul(a, b)
 #     return perf(ms), perf(max_ms), perf(min_ms)
 
 # benchmark.run(show_plots=True, print_data=True)
+
+
+# %%
+# MetaX TN Pipeline Benchmark
+# ---------------------------
+#
+# Compare the MetaX asynchronous TN pipeline with the same MMA code generation
+# and launch configuration while disabling only the new TN pipeline passes.
+
+TN_BLOCK_SIZE = 64
+TN_INNER_STAGE_BLOCK_SIZE = 128
+TN_GROUP_SIZE_M = 8
+TN_BENCHMARK_SHAPES = [2**power for power in range(7, 13)]
+TN_INNER_STAGE_TEST_SHAPES = [2**power for power in range(7, 13)]
+
+
+@triton.jit
+def tn_matmul_kernel(
+        a_ptr, b_ptr, c_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_remaining = K - k * BLOCK_SIZE_K
+        a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < k_remaining)
+        b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator.to(tl.float16), mask=c_mask)
+
+
+def launch_tn_matmul(
+        a,
+        b,
+        c,
+        *,
+        block_size=TN_BLOCK_SIZE,
+        inner_stages=(1, 1),
+        outer_stages=1,
+):
+    M, K = a.shape
+    _, N = b.shape
+    grid = (triton.cdiv(M, block_size) * triton.cdiv(N, block_size), )
+    tn_matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=block_size,
+        BLOCK_SIZE_N=block_size,
+        BLOCK_SIZE_K=block_size,
+        GROUP_SIZE_M=TN_GROUP_SIZE_M,
+        pipeline="cpasync",
+        inner_stages=inner_stages,
+        num_stages=outer_stages,
+        num_warps=4,
+    )
+
+
+def check_tn_inner_stage_pipeline():
+    print("\nMetaX TN inner-stage pipeline correctness")
+    print("inner stages=(4, 4), outer stages=1, block=128x128x128, warps=4")
+
+    for shape in TN_INNER_STAGE_TEST_SHAPES:
+        torch.manual_seed(0)
+        a = torch.randn((shape, shape), device=DEVICE, dtype=torch.float16) * 0.1
+        b_storage = torch.randn((shape, shape), device=DEVICE, dtype=torch.float16) * 0.1
+        b = b_storage.T
+        actual = torch.empty((shape, shape), device=DEVICE, dtype=torch.float16)
+
+        launch_tn_matmul(
+            a,
+            b,
+            actual,
+            block_size=TN_INNER_STAGE_BLOCK_SIZE,
+            inner_stages=(4, 4),
+            outer_stages=1,
+        )
+        expected = torch.matmul(a, b)
+        torch.cuda.synchronize()
+        max_diff = (actual - expected).abs().max().item()
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=0)
+        print(f"shape={shape:4d} max_diff={max_diff:.8f} PASS")
+
+
+def benchmark_tn_pipeline():
+    print("\nMetaX TN matmul pipeline benchmark")
+    print("FP16 input/output, FP32 accumulation, block=64x64x64, warps=4, outer stages=2")
+    print(f"{'Shape':>8} {'No pipeline':>14} {'Pipeline':>14} "
+          f"{'No-pipe TF':>12} {'Pipe TF':>12} {'Speedup':>10}")
+
+    for shape in TN_BENCHMARK_SHAPES:
+        torch.manual_seed(0)
+        a = torch.randn((shape, shape), device=DEVICE, dtype=torch.float16) * 0.1
+        b_storage = torch.randn((shape, shape), device=DEVICE, dtype=torch.float16) * 0.1
+        b = b_storage.T
+        c_no_pipeline = torch.empty((shape, shape), device=DEVICE, dtype=torch.float16)
+        c_pipeline = torch.empty_like(c_no_pipeline)
+
+        launch_tn_matmul(a, b, c_no_pipeline)
+        launch_tn_matmul(a, b, c_pipeline, outer_stages=2)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(c_pipeline, c_no_pipeline, atol=1e-2, rtol=0)
+
+        quantiles = [0.5, 0.2, 0.8]
+        no_pipeline_ms, _, _ = triton.testing.do_bench(
+            lambda: launch_tn_matmul(a, b, c_no_pipeline),
+            warmup=200,
+            rep=1000,
+            quantiles=quantiles,
+        )
+        pipeline_ms, _, _ = triton.testing.do_bench(
+            lambda: launch_tn_matmul(a, b, c_pipeline, outer_stages=2),
+            warmup=200,
+            rep=1000,
+            quantiles=quantiles,
+        )
+        no_pipeline_tflops = 2.0 * shape**3 / (no_pipeline_ms * 1.0e9)
+        pipeline_tflops = 2.0 * shape**3 / (pipeline_ms * 1.0e9)
+        speedup = no_pipeline_ms / pipeline_ms
+        print(f"{shape:8d} {no_pipeline_ms:11.6f} ms {pipeline_ms:11.6f} ms "
+              f"{no_pipeline_tflops:12.3f} {pipeline_tflops:12.3f} {speedup:9.3f}x")
+
+
+if __name__ == "__main__":
+    check_tn_inner_stage_pipeline()
+    benchmark_tn_pipeline()

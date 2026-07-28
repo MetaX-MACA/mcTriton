@@ -52,6 +52,20 @@ Triton MLIR Dialects and Ops
 
    dialects/dialects
 
+MetaX Backend Design
+--------------------
+
+- :doc:`SplitTensorMap <design/metax-split-tensor-map>`
+- :doc:`PipelineAsyncBase <design/metax-pipeline-async-base>`
+
+.. toctree::
+   :maxdepth: 1
+   :caption: MetaX Backend Design
+   :hidden:
+
+   design/metax-split-tensor-map
+   design/metax-pipeline-async-base
+
 Going Further
 -------------
 

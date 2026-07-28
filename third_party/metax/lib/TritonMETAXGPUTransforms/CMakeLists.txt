@@ -4,7 +4,7 @@ add_triton_library(TritonMETAXGPUTransforms
   MACACommon.cpp
   PipelineMACABasic.cpp
   PipelineAsyncBase.cpp
-  PipelineAsyncTN.cpp
+  SplitTensorMap.cpp
   PipelineAsyncTT.cpp
   ChangeLayoutFromRepNToElemN.cpp
   OptimizeCStorePass.cpp
