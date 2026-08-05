@@ -285,15 +285,14 @@ class MACABackend(BaseBackend):
         if capability // 10 >= 8:
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             if use_opt_maca_mma:
-                if opt.pipeline == "basic":
-                    metax.passes.ttgpuir.add_pipeline_maca(pm, opt.num_stages, opt.pipeline_load_num, fullstage, False)
-                else:
-                    mixed = True if 'mixed' in opt.pipeline else False
-                    metax.passes.ttgpuir.add_tritonmetaxgpu_addptr_opt_pass(pm, opt.num_stages, fullstage, mixed)
-                    passes.ttgpuir.add_remove_layout_conversions(pm)
+                mixed = 'mixed' in opt.pipeline
+                metax.passes.ttgpuir.add_tritonmetaxgpu_addptr_opt_pass(pm, opt.num_stages, fullstage, mixed)
+                passes.ttgpuir.add_remove_layout_conversions(pm)
+                if not opt.pipeline.startswith("basic") or inner_stages != (0, 0):
                     metax.passes.ttgpuir.add_split_tensor_map(pm, inner_stages[0], inner_stages[1])
+                if not opt.pipeline.startswith("basic"):
                     metax.passes.ttgpuir.add_pipeline_async_tt(pm, opt.num_stages)
-                    metax.passes.ttgpuir.add_pipeline_async_base(pm, opt.num_stages, fullstage, mixed)
+                metax.passes.ttgpuir.add_pipeline_async_base(pm, opt.num_stages, fullstage, mixed)
             else:
                 passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         passes.ttgpuir.add_prefetch(pm)

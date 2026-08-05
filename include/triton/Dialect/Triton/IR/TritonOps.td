@@ -248,6 +248,7 @@ def TT_LoadOp : TT_Op<"load", [
       DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::NONE">:$cache,
       DefaultValuedAttr<TT_EvictionPolicyAttr, "::mlir::triton::EvictionPolicy::NORMAL">:$evict,
       DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
+      DefaultValuedAttr<TT_LoadPipelineAttr, "::mlir::triton::LoadPipeline::NONE">:$pipeline,
       DefaultValuedAttr<DenseI64ArrayAttr, "::llvm::ArrayRef<int64_t>{}">:$contiguityInterConstGroup // USE_MACA
     );
 

@@ -80,6 +80,7 @@ struct TritonMETAXGPUSplitTensorMapPass
         load.getLoc(), subResultType, ptr, mask, other,
         load.getBoundaryCheckAttr(), load.getPaddingAttr(), load.getCache(),
         load.getEvict(), load.getIsVolatile(),
+        load.getPipeline(),
         load.getContiguityInterConstGroup());
     setLoadAttrs(builder, subLoad, operandName, stage);
     return subLoad;

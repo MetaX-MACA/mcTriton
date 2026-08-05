@@ -2,8 +2,9 @@
 
 ## 目标
 
-`PipelineAsyncBase` 消费 `SplitTensorMap` 标记的 load/dot 循环，将
-同步全局 load 改写为：
+`PipelineAsyncBase` 是 MetaX 的统一 load/dot pipeline。每个 `tt.load`
+可以独立选择寄存器 tensor n-buffer 或 shared-memory n-buffer。选择
+shared 的 load 会从同步全局 load 改写为：
 
 ```text
 ttg.async_copy_global_to_local
@@ -24,6 +25,20 @@ shared-to-register load 和 dot 交错。MetaX 不插入
 | `numStages` / Python `num_stages` | K 方向 outer buffer 数 |
 | `stage_m`, `stage_n` | `SplitTensorMap` 写入的 M/N inner 切分数 |
 | `isFullStage`, `mixed` | 保留在 pass 接口中；当前新调度逻辑未据此分支 |
+| `tl.load(..., pipeline=...)` | 按 load 指定 `register`、`shared` 或空字符串 |
+
+Triton kernel 示例：
+
+```python
+a = tl.load(a_ptrs, mask=a_mask, other=0.0, pipeline="shared")
+b = tl.load(b_ptrs, mask=b_mask, other=0.0, pipeline="register")
+acc = tl.dot(a, b, acc)
+```
+
+`pipeline` 是 `tt.load` 的正式 enum attribute，从 Triton 源码进入 TTIR。
+空字符串对应 `none`，该 load 不参与统一 pipeline。`SplitTensorMap`
+切分 tensor 时会把属性复制到每个子 load，因此控制不会因 inner-stage
+切分丢失。buffer 策略不再通过 `triton.Config` 按 load 顺序设置。
 
 选择路径的规则是：
 
@@ -36,11 +51,17 @@ shared-to-register load 和 dot 交错。MetaX 不插入
 因此 inner stage 和 outer stage 是两个正交概念。前者切 M/N 并在一个 K
 迭代内复用 shared memory，后者在多个 K 迭代间轮转 shared buffer。
 
+register 模式不创建 shared allocation。`tt.load` 及其地址依赖排在
+pipeline stage 0，dot operand conversion 和 dot 排在计算 stage；
+PipelineExpander 自动把 load 的 tensor SSA 结果变成循环携带值，因此
+形成由 `num_stages` 控制的寄存器 n-buffer。register 与 shared load
+可以出现在同一个循环和同一条 dot 上。
+
 ## 输入契约
 
-pass 只收集直接位于目标 `scf.for` 中、且带
-`metax.split_tensor_map.operand` 的 `tt.load`。每个 load 必须满足
-`canBeAsyncLoad`。
+pass 收集直接位于目标 `scf.for` 中并流向 dot operand conversion 的
+二维 `tt.load`。只有选择 shared 的 load 必须满足 `canBeAsyncLoad`；
+register load 不受这个限制。
 
 load 到 dot operand 之间允许以下单 use 链：
 
@@ -174,8 +195,8 @@ removePipeliningAttributes(module)
 
 ## 限制
 
-- 依赖 `SplitTensorMap` 的属性契约，不能独立匹配任意 load/dot。
-- 目标 load 必须可异步化，且从 load 到 dot operand 必须是单 use 的
+- 只处理流向 dot operand 的二维 load，不是任意 load pipeline。
+- shared load 必须可异步化，且从 load 到 dot operand 必须是单 use 的
   受支持链。
 - 循环中的每条 dot 都必须能映射到 inner stage。
 - inner 路径的 `totalGVM / 2` 假定 A/B 搬运能够按当前成对调度模型
@@ -193,3 +214,6 @@ removePipeliningAttributes(module)
    `torch.matmul` 的精度比较。
 2. `inner_stages=(1,1), num_stages=1/2, block=64` 的无 pipeline 与
    outer pipeline 性能及精度比较。
+3. A/B load 的 `shared/shared`、`shared/register`、`register/shared`、
+   `register/register` 和未标注五种组合；同时检查 TTIR 的 per-load
+   属性、TTGIR 的 async/register 结构以及运行精度。

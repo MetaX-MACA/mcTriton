@@ -59,10 +59,12 @@ def TritonMETAXGPUPipelineMACA : Pass<"tritonmetaxgpu-pipeline-maca", "mlir::Mod
 }
 
 def TritonMETAXGPUPipelineAsyncNT : Pass<"tritonmetaxgpu-pipeline-async-nt", "mlir::ModuleOp"> {
-  let summary = "pipeline-async-nt";
+  let summary = "unified register/shared-memory pipeline";
 
   let description = [{
-    The pipeline which supports InsertSliceAsyncOp, recommanded order of A, B input matrix is NT.
+    Pipeline dot operand loads through either register tensors or asynchronous
+    global-to-shared copies. Individual tt.load operations select their buffer
+    kind with the tt.load pipeline attribute.
   }];
 
   let constructor = "mlir::createTritonMETAXGPUPipelineAsyncBasePass()";

@@ -34,6 +34,18 @@ struct TritonMETAXGPUPipelineAsyncBasePass
     this->mixed = mixed;
   }
 
+  enum class LoadBufferKind { Register, Shared, None };
+
+  struct PipelineLoad {
+    tt::LoadOp load;
+    SmallVector<Operation *> conversionChain;
+    Operation *dotOperandConversion = nullptr;
+    RankedTensorType dotOperandType;
+    int innerStage = 0;
+    StringRef operand;
+    LoadBufferKind kind = LoadBufferKind::None;
+  };
+
   struct AsyncLoadOps {
     Operation *copyView = nullptr;
     Operation *copyIndex = nullptr;
@@ -45,6 +57,18 @@ struct TritonMETAXGPUPipelineAsyncBasePass
     bool isA = false;
     unsigned gvmCount = 0;
   };
+
+  static LoadBufferKind getLoadBufferKind(tt::LoadOp load) {
+    switch (load.getPipeline()) {
+    case tt::LoadPipeline::REGISTER:
+      return LoadBufferKind::Register;
+    case tt::LoadPipeline::SHARED:
+      return LoadBufferKind::Shared;
+    case tt::LoadPipeline::NONE:
+      return LoadBufferKind::None;
+    }
+    llvm_unreachable("unknown tt.load pipeline kind");
+  }
 
   static void collectDepsInLoop(Operation *op, scf::ForOp loop,
                                 llvm::SmallPtrSetImpl<Operation *> &deps) {
@@ -108,27 +132,55 @@ struct TritonMETAXGPUPipelineAsyncBasePass
   LogicalResult pipelineLoop(scf::ForOp loop,
                              tt::ModuleAxisInfoAnalysis &axisInfo) {
     bool useInnerPrefetch = numStages == 1;
-    SmallVector<tt::LoadOp> loads;
+    SmallVector<PipelineLoad> loads;
     loop.walk([&](tt::LoadOp load) {
-      if (load->hasAttr("metax.split_tensor_map.operand") &&
-          load->getParentOfType<scf::ForOp>() == loop)
-        loads.push_back(load);
+      if (load->getParentOfType<scf::ForOp>() != loop)
+        return;
+      auto loadType = dyn_cast<RankedTensorType>(load.getType());
+      if (!loadType || loadType.getRank() < 2)
+        return;
+
+      PipelineLoad pipelineLoad;
+      pipelineLoad.load = load;
+      pipelineLoad.kind = getLoadBufferKind(load);
+      if (pipelineLoad.kind == LoadBufferKind::None)
+        return;
+      pipelineLoad.dotOperandConversion = findDotOperandConversion(
+          load.getResult(), pipelineLoad.conversionChain,
+          pipelineLoad.dotOperandType);
+      if (!pipelineLoad.dotOperandConversion)
+        return;
+      if (auto stage = load->getAttrOfType<IntegerAttr>(
+              "metax.split_tensor_map.inner_stage"))
+        pipelineLoad.innerStage = stage.getInt();
+      if (auto operand = load->getAttrOfType<StringAttr>(
+              "metax.split_tensor_map.operand"))
+        pipelineLoad.operand = operand.getValue();
+      loads.push_back(std::move(pipelineLoad));
     });
     if (loads.empty())
       return failure();
 
-    SmallVector<AsyncLoadOps> loweredLoads;
-    for (tt::LoadOp load : loads) {
-      if (!tt::canBeAsyncLoad(load))
+    SmallVector<tt::LoadOp> registerLoads;
+    for (PipelineLoad &pipelineLoad : loads) {
+      if (pipelineLoad.kind == LoadBufferKind::Register)
+        registerLoads.push_back(pipelineLoad.load);
+      if (pipelineLoad.kind == LoadBufferKind::Shared &&
+          !tt::canBeAsyncLoad(pipelineLoad.load)) {
+        pipelineLoad.load.getOperation()->emitError(
+            "load selected for shared buffering cannot be lowered to an "
+            "asynchronous global-to-local copy");
         return failure();
+      }
+    }
 
+    SmallVector<AsyncLoadOps> loweredLoads;
+    for (PipelineLoad &pipelineLoad : loads) {
+      if (pipelineLoad.kind != LoadBufferKind::Shared)
+        continue;
+      tt::LoadOp load = pipelineLoad.load;
       auto loadType = cast<RankedTensorType>(load.getType());
-      SmallVector<Operation *> dotConversionChain;
-      RankedTensorType dotOperandType;
-      Operation *dotOperandConversion = findDotOperandConversion(
-          load.getResult(), dotConversionChain, dotOperandType);
-      RankedTensorType localLoadType =
-          dotOperandConversion ? dotOperandType : loadType;
+      RankedTensorType localLoadType = pipelineLoad.dotOperandType;
       auto sharedEncoding = tt::getSharedEncoding(load);
       unsigned bufferCount = useInnerPrefetch ? 1 : numStages;
       Value alloc = tt::createAlloc(loop, loadType, load.getLoc(),
@@ -137,13 +189,8 @@ struct TritonMETAXGPUPipelineAsyncBasePass
 
       OpBuilder builder(load);
       AsyncLoadOps ops;
-      ops.innerStage =
-          load->getAttrOfType<IntegerAttr>(
-                  "metax.split_tensor_map.inner_stage")
-              .getInt();
-      ops.isA =
-          load->getAttrOfType<StringAttr>("metax.split_tensor_map.operand")
-              .getValue() == "A";
+      ops.innerStage = pipelineLoad.innerStage;
+      ops.isA = pipelineLoad.operand == "A";
       ops.gvmCount = getGVMNumberPerOp(load);
 
       Value copyView;
@@ -182,22 +229,21 @@ struct TritonMETAXGPUPipelineAsyncBasePass
           builder, load.getLoc(), localLoadType, loadView);
       ops.localLoad = localLoad;
 
-      if (dotOperandConversion) {
-        dotOperandConversion->getResult(0).replaceAllUsesWith(
-            localLoad.getResult());
-        dotOperandConversion->erase();
-        for (Operation *op : llvm::reverse(dotConversionChain)) {
-          if (op->use_empty())
-            op->erase();
-        }
-      } else {
-        load.getResult().replaceAllUsesWith(localLoad.getResult());
+      pipelineLoad.dotOperandConversion->getResult(0).replaceAllUsesWith(
+          localLoad.getResult());
+      pipelineLoad.dotOperandConversion->erase();
+      for (Operation *op : llvm::reverse(pipelineLoad.conversionChain)) {
+        if (op->use_empty())
+          op->erase();
       }
       if (!load.getResult().use_empty())
         return failure();
       load.erase();
       loweredLoads.push_back(ops);
     }
+
+    if (registerLoads.empty() && loweredLoads.empty())
+      return failure();
 
     llvm::sort(loweredLoads, [](const AsyncLoadOps &lhs,
                                 const AsyncLoadOps &rhs) {
@@ -220,7 +266,6 @@ struct TritonMETAXGPUPipelineAsyncBasePass
 
     DenseMap<int, SmallVector<Operation *, 4>> dotsByReadyStage;
     unsigned numDots = 0;
-    unsigned numScheduledDots = 0;
     loop.walk([&](tt::DotOp dot) {
       if (dot->getParentOfType<scf::ForOp>() != loop)
         return;
@@ -231,17 +276,15 @@ struct TritonMETAXGPUPipelineAsyncBasePass
         collectAsyncLoadStages(operand.getDefiningOp(), loop, localLoadStages,
                                visited, readyStage);
       }
-      if (readyStage >= 0) {
+      if (readyStage >= 0)
         dotsByReadyStage[readyStage].push_back(dot);
-        ++numScheduledDots;
-      }
     });
-    if (numDots == 0 || numScheduledDots != numDots)
+    if (numDots == 0)
       return failure();
 
     DenseMap<int, SmallVector<Operation *, 2>> syncOps;
     OpBuilder syncBuilder(loop.getBody()->getTerminator());
-    if (useInnerPrefetch) {
+    if (!loweredLoads.empty() && useInnerPrefetch) {
       unsigned remainingGVM = totalGVM / 2;
       for (int innerStage : innerStages) {
         auto arrive = syncBuilder.create<ttg::GVMArriveOp>(
@@ -250,7 +293,7 @@ struct TritonMETAXGPUPipelineAsyncBasePass
             syncBuilder.create<ttg::BarrierSharedOp>(loop.getLoc());
         syncOps[innerStage] = {arrive, barrier};
       }
-    } else {
+    } else if (!loweredLoads.empty()) {
       DenseMap<int, unsigned> gvmByInnerStage;
       for (const AsyncLoadOps &ops : loweredLoads)
         gvmByInnerStage[ops.innerStage] += ops.gvmCount;
@@ -270,15 +313,18 @@ struct TritonMETAXGPUPipelineAsyncBasePass
 
     std::vector<std::pair<Operation *, unsigned>> schedule;
     llvm::SmallPtrSet<Operation *, 32> scheduled;
-    llvm::SmallPtrSet<Operation *, 32> allCopyDeps;
+    llvm::SmallPtrSet<Operation *, 32> allPrefetchDeps;
     llvm::SmallPtrSet<Operation *, 32> preCopyStage;
     for (const AsyncLoadOps &ops : loweredLoads)
-      collectDepsInLoop(ops.copy, loop, allCopyDeps);
+      collectDepsInLoop(ops.copy, loop, allPrefetchDeps);
+    for (tt::LoadOp load : registerLoads)
+      collectDepsInLoop(load, loop, allPrefetchDeps);
 
-    // A stage-0 copy consumes loop-carried pointers from the next iteration.
-    // Schedule the yield-side pointer increments before that copy.
+    // A stage-0 prefetch consumes loop-carried pointers from the next
+    // iteration. Schedule the yield-side pointer increments early enough for
+    // both register loads and global-to-shared copies.
     auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    for (Operation *op : allCopyDeps) {
+    for (Operation *op : allPrefetchDeps) {
       for (Value operand : op->getOperands()) {
         auto arg = dyn_cast<BlockArgument>(operand);
         if (!arg || arg.getOwner() != loop.getBody() ||
@@ -309,6 +355,12 @@ struct TritonMETAXGPUPipelineAsyncBasePass
           scheduleDeps(ops.copy, 0);
       }
     };
+
+    // Keeping tt.load in SSA form makes PipelineExpander carry the loaded
+    // tensor across iterations. This is the register n-buffer counterpart of
+    // the shared-memory ring allocated for async copies.
+    for (tt::LoadOp load : registerLoads)
+      scheduleDeps(load, 0);
 
     if (useInnerPrefetch) {
       llvm::SmallPtrSet<Operation *, 8> deferredRegisterPrefetchOps;
@@ -444,27 +496,25 @@ struct TritonMETAXGPUPipelineAsyncBasePass
     ModuleOp module = getOperation();
     tt::ModuleAxisInfoAnalysis axisInfo(module);
     SmallVector<scf::ForOp> loops;
-    module.walk([&](scf::ForOp loop) {
-      if (!loop->hasAttr("metax.split_tensor_map"))
+    llvm::SmallPtrSet<Operation *, 8> seenLoops;
+    module.walk([&](tt::LoadOp load) {
+      if (load.getPipeline() == tt::LoadPipeline::NONE)
         return;
-      if (numStages == 1) {
-        auto stageM =
-            loop->getAttrOfType<IntegerAttr>("metax.split_tensor_map.stage_m");
-        auto stageN =
-            loop->getAttrOfType<IntegerAttr>("metax.split_tensor_map.stage_n");
-        if (!stageM || !stageN ||
-            (stageM.getInt() <= 1 && stageN.getInt() <= 1))
-          return;
-      }
+      auto loop = load->getParentOfType<scf::ForOp>();
+      if (!loop || !seenLoops.insert(loop).second)
+        return;
       loops.push_back(loop);
     });
 
     bool transformed = false;
     for (scf::ForOp loop : loops) {
       if (failed(pipelineLoop(loop, axisInfo))) {
-        loop.emitError("failed to expand the MetaX async pipeline");
-        signalPassFailure();
-        return;
+        if (loop->hasAttr("metax.split_tensor_map")) {
+          loop.emitError("failed to expand the MetaX unified pipeline");
+          signalPassFailure();
+          return;
+        }
+        continue;
       }
       transformed = true;
     }

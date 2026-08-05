@@ -466,6 +466,8 @@ def tn_matmul_kernel(
         BLOCK_SIZE_N: tl.constexpr,
         BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
+        A_LOAD_PIPELINE: tl.constexpr,
+        B_LOAD_PIPELINE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -488,8 +490,8 @@ def tn_matmul_kernel(
         k_remaining = K - k * BLOCK_SIZE_K
         a_mask = (offs_am[:, None] < M) & (offs_k[None, :] < k_remaining)
         b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0, pipeline=A_LOAD_PIPELINE)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0, pipeline=B_LOAD_PIPELINE)
         accumulator = tl.dot(a, b, accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -509,25 +511,104 @@ def launch_tn_matmul(
         block_size=TN_BLOCK_SIZE,
         inner_stages=(1, 1),
         outer_stages=1,
+        load_pipelines=("", ""),
+        compile_only=False,
 ):
     M, K = a.shape
     _, N = b.shape
     grid = (triton.cdiv(M, block_size) * triton.cdiv(N, block_size), )
-    tn_matmul_kernel[grid](
+    args = (
         a, b, c,
         M, N, K,
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
+    )
+    meta = dict(
         BLOCK_SIZE_M=block_size,
         BLOCK_SIZE_N=block_size,
         BLOCK_SIZE_K=block_size,
         GROUP_SIZE_M=TN_GROUP_SIZE_M,
-        pipeline="cpasync",
+        A_LOAD_PIPELINE=load_pipelines[0],
+        B_LOAD_PIPELINE=load_pipelines[1],
         inner_stages=inner_stages,
         num_stages=outer_stages,
         num_warps=4,
     )
+    if compile_only:
+        return tn_matmul_kernel.warmup(*args, grid=grid, **meta)
+    return tn_matmul_kernel[grid](*args, **meta)
+
+
+def check_tn_pipeline_load_modes():
+    print("\nMetaX TN per-load pipeline buffer correctness")
+    print("A/B modes: shared/shared, shared/register, register/shared, "
+          "register/register, none/none")
+
+    shape = 256
+    torch.manual_seed(0)
+    a = torch.randn((shape, shape), device=DEVICE, dtype=torch.float16) * 0.1
+    b_storage = torch.randn((shape, shape), device=DEVICE, dtype=torch.float16) * 0.1
+    b = b_storage.T
+    expected = torch.matmul(a, b)
+    async_counts = {}
+    register_counts = {}
+    ttir_pipeline_counts = {}
+
+    for modes in (("shared", "shared"), ("shared", "register"),
+                  ("register", "shared"), ("register", "register"),
+                  ("", "")):
+        actual = torch.empty_like(expected)
+        compiled = launch_tn_matmul(
+            a,
+            b,
+            actual,
+            inner_stages=(1, 1),
+            outer_stages=2,
+            load_pipelines=modes,
+            compile_only=True,
+        )
+        ttir = compiled.asm["ttir"]
+        ttgir = compiled.asm["ttgir"]
+        async_count = ttgir.count("ttg.async_copy_global_to_local")
+        register_count = ttgir.count("pipeline = 2 : i32")
+        ttir_register_count = ttir.count("pipeline = 2 : i32")
+        ttir_shared_count = ttir.count("pipeline = 3 : i32")
+        async_counts[modes] = async_count
+        register_counts[modes] = register_count
+        ttir_pipeline_counts[modes] = (ttir_register_count, ttir_shared_count)
+
+        launch_tn_matmul(
+            a,
+            b,
+            actual,
+            inner_stages=(1, 1),
+            outer_stages=2,
+            load_pipelines=modes,
+        )
+        torch.cuda.synchronize()
+        max_diff = (actual - expected).abs().max().item()
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=0)
+        mode_names = tuple(mode or "none" for mode in modes)
+        print(f"A={mode_names[0]:8s} B={mode_names[1]:8s} "
+              f"async_ops={async_count:2d} register_loads={register_count:2d} "
+              f"ttir_pipeline={ttir_register_count}/{ttir_shared_count} "
+              f"max_diff={max_diff:.8f} PASS")
+
+    assert async_counts[("shared", "shared")] > async_counts[("shared", "register")] > 0
+    assert async_counts[("shared", "shared")] > async_counts[("register", "shared")] > 0
+    assert async_counts[("register", "register")] == 0
+    assert register_counts[("shared", "shared")] == 0
+    assert register_counts[("shared", "register")] > 0
+    assert register_counts[("register", "shared")] > 0
+    assert register_counts[("register", "register")] > register_counts[("shared", "register")]
+    assert async_counts[("", "")] == 0
+    assert register_counts[("", "")] == 0
+    assert ttir_pipeline_counts[("shared", "shared")] == (0, 2)
+    assert ttir_pipeline_counts[("shared", "register")] == (1, 1)
+    assert ttir_pipeline_counts[("register", "shared")] == (1, 1)
+    assert ttir_pipeline_counts[("register", "register")] == (2, 0)
+    assert ttir_pipeline_counts[("", "")] == (0, 0)
 
 
 def check_tn_inner_stage_pipeline():
@@ -548,6 +629,7 @@ def check_tn_inner_stage_pipeline():
             block_size=TN_INNER_STAGE_BLOCK_SIZE,
             inner_stages=(4, 4),
             outer_stages=1,
+            load_pipelines=("shared", "shared"),
         )
         expected = torch.matmul(a, b)
         torch.cuda.synchronize()
@@ -571,7 +653,8 @@ def benchmark_tn_pipeline():
         c_pipeline = torch.empty_like(c_no_pipeline)
 
         launch_tn_matmul(a, b, c_no_pipeline)
-        launch_tn_matmul(a, b, c_pipeline, outer_stages=2)
+        launch_tn_matmul(a, b, c_pipeline, outer_stages=2,
+                         load_pipelines=("shared", "shared"))
         torch.cuda.synchronize()
         torch.testing.assert_close(c_pipeline, c_no_pipeline, atol=1e-2, rtol=0)
 
@@ -583,7 +666,8 @@ def benchmark_tn_pipeline():
             quantiles=quantiles,
         )
         pipeline_ms, _, _ = triton.testing.do_bench(
-            lambda: launch_tn_matmul(a, b, c_pipeline, outer_stages=2),
+            lambda: launch_tn_matmul(a, b, c_pipeline, outer_stages=2,
+                                     load_pipelines=("shared", "shared")),
             warmup=200,
             rep=1000,
             quantiles=quantiles,
@@ -596,5 +680,6 @@ def benchmark_tn_pipeline():
 
 
 if __name__ == "__main__":
+    check_tn_pipeline_load_modes()
     check_tn_inner_stage_pipeline()
     benchmark_tn_pipeline()

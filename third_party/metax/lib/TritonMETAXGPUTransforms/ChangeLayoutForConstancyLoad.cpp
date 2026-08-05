@@ -54,7 +54,8 @@ private:
         targetLoad.getLoc(), newResType, newPtr, Value(), Value(),
         targetLoad.getBoundaryCheckAttr(), targetLoad.getPaddingAttr(),
         targetLoad.getCache(), targetLoad.getEvict(),
-        targetLoad.getIsVolatile(), targetLoad.getContiguityInterConstGroup());
+        targetLoad.getIsVolatile(), targetLoad.getPipeline(),
+        targetLoad.getContiguityInterConstGroup());
     auto newLoadCvtRes = builder.create<ttg::ConvertLayoutOp>(
         oldPtr.getLoc(), tensorType, newLoadOp);
     targetLoad.getResult().replaceAllUsesWith(newLoadCvtRes.getResult());
