@@ -49,6 +49,16 @@ def TT_PaddingOptionAttr : I32EnumAttr<
     let cppNamespace = "::mlir::triton";
 }
 
+def TT_LoadPipelineAttr : I32EnumAttr<
+    "LoadPipeline", "",
+    [
+        I32EnumAttrCase<"NONE", 1, "none">,
+        I32EnumAttrCase<"REGISTER", 2, "register">,
+        I32EnumAttrCase<"SHARED", 3, "shared">
+    ]> {
+    let cppNamespace = "::mlir::triton";
+}
+
 // atomic
 def TT_AtomicRMWAttr : I32EnumAttr<
     "RMWOp", "",

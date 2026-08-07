@@ -268,6 +268,12 @@ void init_triton_ir(py::module &&m) {
       .value("PAD_NAN", PaddingOption::PAD_NAN)
       .export_values();
 
+  py::enum_<LoadPipeline>(m, "LOAD_PIPELINE", py::module_local())
+      .value("NONE", LoadPipeline::NONE)
+      .value("REGISTER", LoadPipeline::REGISTER)
+      .value("SHARED", LoadPipeline::SHARED)
+      .export_values();
+
   py::enum_<CacheModifier>(m, "CACHE_MODIFIER", py::module_local())
       .value("NONE", CacheModifier::NONE)
       .value("CA", CacheModifier::CA)
@@ -1466,9 +1472,13 @@ void init_triton_ir(py::module &&m) {
       // Input/Output
       .def("create_load",
            [](TritonOpBuilder &self, Value &ptrs, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
-                                        isVolatile);
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              LoadPipeline pipeline) -> Value {
+             auto load = self.create<LoadOp>(ptrs, cacheModifier,
+                                             evictionPolicy, isVolatile);
+             load->setAttr("pipeline", LoadPipelineAttr::get(
+                                               self.getContext(), pipeline));
+             return load;
            })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,
@@ -1481,10 +1491,13 @@ void init_triton_ir(py::module &&m) {
               std::vector<int32_t> &boundaryCheck,
               std::optional<PaddingOption> paddingOption,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptr, boundaryCheck, paddingOption,
-                                        cacheModifier, evictionPolicy,
-                                        isVolatile);
+              bool isVolatile, LoadPipeline pipeline) -> Value {
+             auto load = self.create<LoadOp>(ptr, boundaryCheck, paddingOption,
+                                             cacheModifier, evictionPolicy,
+                                             isVolatile);
+             load->setAttr("pipeline", LoadPipelineAttr::get(
+                                               self.getContext(), pipeline));
+             return load;
            })
       .def("create_tensor_pointer_store",
            [](TritonOpBuilder &self, Value &ptr, Value &val,
@@ -1496,10 +1509,15 @@ void init_triton_ir(py::module &&m) {
       .def("create_masked_load",
            [](TritonOpBuilder &self, Value &ptrs, Value &mask,
               std::optional<Value> &other, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
-                                        cacheModifier, evictionPolicy,
-                                        isVolatile);
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              LoadPipeline pipeline) -> Value {
+             auto load = self.create<LoadOp>(ptrs, mask,
+                                             other.value_or(Value()),
+                                             cacheModifier, evictionPolicy,
+                                             isVolatile);
+             load->setAttr("pipeline", LoadPipelineAttr::get(
+                                               self.getContext(), pipeline));
+             return load;
            })
       .def("create_masked_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &val, Value &mask,

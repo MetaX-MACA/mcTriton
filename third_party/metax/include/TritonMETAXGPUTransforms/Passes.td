@@ -59,10 +59,12 @@ def TritonMETAXGPUPipelineMACA : Pass<"tritonmetaxgpu-pipeline-maca", "mlir::Mod
 }
 
 def TritonMETAXGPUPipelineAsyncNT : Pass<"tritonmetaxgpu-pipeline-async-nt", "mlir::ModuleOp"> {
-  let summary = "pipeline-async-nt";
+  let summary = "unified register/shared-memory pipeline";
 
   let description = [{
-    The pipeline which supports InsertSliceAsyncOp, recommanded order of A, B input matrix is NT.
+    Pipeline dot operand loads through either register tensors or asynchronous
+    global-to-shared copies. Individual tt.load operations select their buffer
+    kind with the tt.load pipeline attribute.
   }];
 
   let constructor = "mlir::createTritonMETAXGPUPipelineAsyncBasePass()";
@@ -82,28 +84,26 @@ def TritonMETAXGPUPipelineAsyncNT : Pass<"tritonmetaxgpu-pipeline-async-nt", "ml
   ];
 }
 
-def TritonMETAXGPUPipelineAsyncTN : Pass<"tritonmetaxgpu-pipeline-async-tn", "mlir::ModuleOp"> {
-  let summary = "pipeline-async-tn";
+def TritonMETAXGPUSplitTensorMap : Pass<"tritonmetaxgpu-split-tensor-map", "mlir::ModuleOp"> {
+  let summary = "split tensor maps used by the MetaX asynchronous pipeline";
 
   let description = [{
-    The pipeline which supports InsertSliceAsyncOp, this pipeline requires that the order of
-    A, B input matrix is TN.
+    Split the M and N dimensions of TN matrix multiplication operands into
+    independently loadable tensor tiles. A 1x1 split preserves the original
+    tensor shapes while marking the loads for the outer K pipeline.
   }];
 
-  let constructor = "mlir::createTritonMETAXGPUPipelineAsyncTNPass()";
+  let constructor = "mlir::createTritonMETAXGPUSplitTensorMapPass()";
 
   let dependentDialects = [];
 
   let options = [
-    Option<"numStages", "num-stages",
-           "int32_t", /*default*/"2",
-           "number of pipeline stages">,
     Option<"innerStageM", "inner-stage-M",
            "int32_t", /*default*/"0",
-           "number of pipeline inner stage of M">,
+           "number of M tensor-map splits">,
     Option<"innerStageN", "inner-stage-N",
            "int32_t", /*default*/"0",
-           "number of pipeline inner stage of N">
+           "number of N tensor-map splits">
   ];
 }
 

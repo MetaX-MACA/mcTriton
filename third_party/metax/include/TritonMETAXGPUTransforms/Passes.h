@@ -16,8 +16,8 @@ std::unique_ptr<Pass> createTritonMETAXGPUPipelineMACAPass(
 std::unique_ptr<Pass> createTritonMETAXGPUPipelineAsyncBasePass(
     int numStages = 2, bool isFullStage = false, bool mixed = false);
 std::unique_ptr<Pass>
-createTritonMETAXGPUPipelineAsyncTNPass(int numStages = 2, int innerStageM = 0,
-                                        int innerStageN = 0);
+createTritonMETAXGPUSplitTensorMapPass(int innerStageM = 0,
+                                       int innerStageN = 0);
 std::unique_ptr<Pass>
 createTritonMETAXGPUPipelineAsyncTTPass(int numStages = 2);
 std::unique_ptr<Pass>

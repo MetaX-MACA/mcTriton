@@ -955,6 +955,15 @@ class TritonSemantic(Generic[TensorTy]):
                 raise ValueError(f"Padding option {padding_option} not supported")
         return padding
 
+    def _str_to_load_pipeline(self, pipeline):
+        if not pipeline:
+            return ir.LOAD_PIPELINE.NONE
+        if pipeline == "register":
+            return ir.LOAD_PIPELINE.REGISTER
+        if pipeline == "shared":
+            return ir.LOAD_PIPELINE.SHARED
+        raise ValueError(f"Load pipeline {pipeline} not supported; expected '', 'register', or 'shared'")
+
     def _str_to_sem(self, sem_option):
         sem = ir.MEM_SEMANTIC.ACQUIRE_RELEASE
         if sem_option:
@@ -995,7 +1004,7 @@ class TritonSemantic(Generic[TensorTy]):
             return sorted(boundary_check)
         return ()
 
-    def _load_block_pointer(self, ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile):
+    def _load_block_pointer(self, ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, pipeline):
         # Load by a block pointer: `pointer_type<block_type<>>`
         # Block pointer can not have `mask` and `other` arguments
         if mask is not None or other is not None:
@@ -1014,10 +1023,11 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Build IR
         return self.tensor(
-            self.builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile),
+            self.builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile,
+                                                    pipeline),
             dst_ty)
 
-    def _load_legacy(self, ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile):
+    def _load_legacy(self, ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, pipeline):
         # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
         if not ptr.type.scalar.is_ptr():
             raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.load`")
@@ -1068,28 +1078,31 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Build IR
         if mask is None:
-            ret = self.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
+            ret = self.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile, pipeline), dst_ty)
         else:
             ret = self.tensor(
                 self.builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache,
-                                                eviction, is_volatile), dst_ty)
+                                                eviction, is_volatile, pipeline), dst_ty)
         if is_bool:
             ret = self.cast(ret, tl.int1)
         return ret
 
     def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,
-             padding_option: str, cache_modifier: str, eviction_policy: str, is_volatile: bool) -> TensorTy:
+             padding_option: str, cache_modifier: str, eviction_policy: str, is_volatile: bool,
+             pipeline: str = "") -> TensorTy:
         # Cache, eviction and padding options
         cache = self._str_to_load_cache_modifier(cache_modifier)
         eviction = self._str_to_eviction_policy(eviction_policy)
         padding = self._str_to_padding_option(padding_option)
+        pipeline = self._str_to_load_pipeline(pipeline)
 
         if ptr.type.is_ptr() and ptr.type.element_ty.is_block():
             # Load by a block pointer: `pointer_type<block_type<>>`
-            return self._load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+            return self._load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile,
+                                            pipeline)
         else:
             # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
-            return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
+            return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, pipeline)
 
     def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str,
                         eviction_policy: str) -> TensorTy:

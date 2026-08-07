@@ -36,9 +36,8 @@ void init_triton_metax_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_3("add_pipeline_async_base",
                      mlir::createTritonMETAXGPUPipelineAsyncBasePass, int, bool,
                      bool);
-  ADD_PASS_WRAPPER_3("add_pipeline_async_tn",
-                     mlir::createTritonMETAXGPUPipelineAsyncTNPass, int, int,
-                     int);
+  ADD_PASS_WRAPPER_2("add_split_tensor_map",
+                     mlir::createTritonMETAXGPUSplitTensorMapPass, int, int);
   ADD_PASS_WRAPPER_1("add_pipeline_async_tt",
                      mlir::createTritonMETAXGPUPipelineAsyncTTPass, int);
   ADD_PASS_WRAPPER_0("add_tritonmetaxgpu_change_layout_from_repn_to_elemn_pass",
@@ -234,6 +233,7 @@ void init_triton_metax(py::module &&m) {
           std::ifstream _fatbin(_fbin, std::ios::binary);
           std::string fatbin(std::istreambuf_iterator<char>(_fatbin), {});
           _fatbin.close();
+          py::gil_scoped_acquire acquire;
           py::bytes bytes(fatbin);
           return std::move(bytes);
         });
